@@ -1,0 +1,1628 @@
+!pip install -q sentence-transformers faiss-cpu langdetect spacy ftfy rake-nltk streamlit pyngrok
+!python -m spacy download en_core_web_sm
+import pandas as pd
+import numpy as np
+import re
+import json
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+import spacy
+from sentence_transformers import SentenceTransformer
+import faiss
+from langdetect import detect, DetectorFactory
+DetectorFactory.seed = 0
+import ftfy
+from rake_nltk import Rake
+from sklearn.feature_extraction.text import TfidfVectorizer
+from collections import Counter
+from google.colab import files
+import os
+uploaded = files.upload()
+try:
+    # Dataset 1: dream_data (25MB) - keeps only text_dream and dream_language
+    dream_data = pd.read_csv('dream_data.csv')
+    print(f"dream_data loaded: {len(dream_data)} rows")
+
+    # Dataset 2: cleaned_dream_interpretations (671KB)
+    dream_interp_1 = pd.read_csv('cleaned_dream_interpretations.csv')
+    print(f"cleaned_dream_interpretations loaded: {len(dream_interp_1)} rows")
+
+    # Dataset 3: dreams (14MB)
+    dreams_text = pd.read_csv('dreams.csv')
+    print(f"dreams loaded: {len(dreams_text)} rows")
+
+    # Dataset 4: dreams_interpretations (435KB)
+    dream_interp_2 = pd.read_csv('dreams_interpretations.csv')
+    print(f"dreams_interpretations loaded: {len(dream_interp_2)} rows")
+
+    # Dataset 5: reddit-dreams (29MB)
+    reddit_dreams = pd.read_csv('reddit-dreams.csv')
+    print(f"reddit-dreams loaded: {len(reddit_dreams)} rows")
+
+except Exception as e:
+    print(f"Error loading files: {e}")
+    print("Make sure file names match exactly (case-sensitive)")
+
+import pandas as pd
+import re
+from ftfy import fix_text
+from langdetect import detect, LangDetectException
+from datetime import datetime, timezone
+def clean_text(text):
+    if pd.isna(text):
+        return ""
+    text = fix_text(str(text))
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'[^\w\s.,!?;:\'-]', '', text)
+    return text
+def is_english(text):
+    try:
+        if len(text.strip()) < 10:
+            return True
+        return detect(text) == 'en'
+    except:
+        return True
+def parse_date_with_quality(s):
+    """Parse date and assign quality label - use TODAY for missing dates"""
+    if pd.isna(s) or s is None or str(s).strip() == "":
+        return datetime.now(timezone.utc), "today"
+    try:
+        dt = pd.to_datetime(s, utc=True, errors="coerce")
+        if pd.isna(dt):
+            return datetime.now(timezone.utc), "today"
+        MIN_DT = pd.Timestamp("1990-01-01", tz="UTC")
+        NOW_DT = pd.Timestamp.now(tz="UTC")
+
+        if dt < MIN_DT or dt > NOW_DT:
+            return NOW_DT.to_pydatetime(), "corrected"
+
+        return dt.to_pydatetime(), "source"
+    except:
+        return datetime.now(timezone.utc), "today"
+print("Cleaning dream_data...")
+dream_data_clean = dream_data[['text_dream', 'dream_language']].copy()
+if 'dream_date' in dream_data.columns:
+    dream_data_clean['dream_date'] = dream_data['dream_date']
+    print("Found dream_date column in dream_data")
+
+dream_data_clean['text_dream'] = dream_data_clean['text_dream'].apply(clean_text)
+dream_data_clean = dream_data_clean[dream_data_clean['text_dream'].str.len() > 20]
+dream_data_clean = dream_data_clean[dream_data_clean['text_dream'] != ""]
+english_mask = dream_data_clean['text_dream'].apply(is_english)
+dream_data_clean = dream_data_clean[english_mask]
+print(f"dream_data cleaned: {len(dream_data_clean)} English dreams")
+
+print("Cleaning dreams dataset...")
+dreams_clean = dreams_text.copy()
+possible_date_cols = ['date', 'created_at', 'timestamp', 'dream_date']
+date_col_found = None
+for col in possible_date_cols:
+    if col in dreams_text.columns:
+        date_col_found = col
+        print(f"Found date column '{col}' in dreams dataset")
+        break
+if date_col_found:
+    dreams_clean = dreams_text[['dreams_text', date_col_found]].copy()
+else:
+    dreams_clean = dreams_text[['dreams_text']].copy()
+    print("No date column found in dreams dataset - will use today's date")
+dreams_clean['dreams_text'] = dreams_clean['dreams_text'].apply(clean_text)
+dreams_clean = dreams_clean[dreams_clean['dreams_text'].str.len() > 20]
+dreams_clean = dreams_clean[dreams_clean['dreams_text'] != ""]
+english_mask = dreams_clean['dreams_text'].apply(is_english)
+dreams_clean = dreams_clean[english_mask]
+print(f"dreams cleaned: {len(dreams_clean)} English dreams")
+
+print("Cleaning reddit-dreams...")
+reddit_clean = reddit_dreams.copy()
+reddit_date_col = None
+for col in ['date', 'created_utc', 'timestamp', 'created_at']:
+    if col in reddit_dreams.columns:
+        reddit_date_col = col
+        print(f"Found date column '{col}' in reddit dataset")
+        break
+if reddit_date_col:
+    reddit_clean = reddit_dreams[['summary', reddit_date_col]].copy()
+else:
+    reddit_clean = reddit_dreams[['summary']].copy()
+    print("No date column found in reddit dataset - will use today's date")
+reddit_clean['summary'] = reddit_clean['summary'].apply(clean_text)
+reddit_clean = reddit_clean[reddit_clean['summary'].str.len() > 20]
+reddit_clean = reddit_clean[reddit_clean['summary'] != ""]
+english_mask = reddit_clean['summary'].apply(is_english)
+reddit_clean = reddit_clean[english_mask]
+print(f"reddit-dreams cleaned: {len(reddit_clean)} English dreams")
+
+print("Cleaning interpretation datasets...")
+dream_interp_1_clean = dream_interp_1.copy()
+dream_interp_1_clean['Word'] = dream_interp_1_clean['Word'].apply(clean_text)
+dream_interp_1_clean['Interpretation'] = dream_interp_1_clean['Interpretation'].apply(clean_text)
+
+dream_interp_2_clean = dream_interp_2.copy()
+dream_interp_2_clean['Dream Symbol'] = dream_interp_2_clean['Dream Symbol'].apply(clean_text)
+dream_interp_2_clean['Interpretation'] = dream_interp_2_clean['Interpretation'].apply(clean_text)
+
+print("Unifying all dream datasets with today's date for missing...")
+all_dreams = []
+
+for _, row in dream_data_clean.iterrows():
+    if 'dream_date' in dream_data_clean.columns:
+        dream_date, date_quality = parse_date_with_quality(row.get('dream_date'))
+    else:
+        dream_date, date_quality = parse_date_with_quality(None)
+    all_dreams.append({
+        'dream_text': row['text_dream'],
+        'source': 'dream_data',
+        'dream_date': dream_date,
+        'date_quality': date_quality,
+        'dream_id': len(all_dreams) + 1
+    })
+for _, row in dreams_clean.iterrows():
+    if date_col_found:
+        dream_date, date_quality = parse_date_with_quality(row.get(date_col_found))
+    else:
+        dream_date, date_quality = parse_date_with_quality(None)
+
+    all_dreams.append({
+        'dream_text': row['dreams_text'],
+        'source': 'dreams',
+        'dream_date': dream_date,
+        'date_quality': date_quality,
+        'dream_id': len(all_dreams) + 1
+    })
+
+for _, row in reddit_clean.iterrows():
+    if reddit_date_col:
+        dream_date, date_quality = parse_date_with_quality(row.get(reddit_date_col))
+    else:
+        dream_date, date_quality = parse_date_with_quality(None)
+    all_dreams.append({
+        'dream_text': row['summary'],
+        'source': 'reddit',
+        'dream_date': dream_date,
+        'date_quality': date_quality,
+        'dream_id': len(all_dreams) + 1
+    })
+
+dreams_df = pd.DataFrame(all_dreams)
+
+print("Removing duplicates...")
+before_dedup = len(dreams_df)
+dreams_df = dreams_df.drop_duplicates(subset=['dream_text']).reset_index(drop=True)
+dreams_df['dream_id'] = range(1, len(dreams_df) + 1)
+after_dedup = len(dreams_df)
+print(f"Removed {before_dedup - after_dedup} duplicates")
+
+print("Creating interpretations dictionary...")
+interpretations_dict = {}
+
+for _, row in dream_interp_1_clean.iterrows():
+    word = str(row['Word']).lower().strip()
+    interpretation = str(row['Interpretation']).strip()
+    if word and interpretation and len(word) > 1:
+        interpretations_dict[word] = interpretation
+
+for _, row in dream_interp_2_clean.iterrows():
+    symbol = str(row['Dream Symbol']).lower().strip()
+    interpretation = str(row['Interpretation']).strip()
+    if symbol and interpretation and len(symbol) > 1:
+        interpretations_dict[symbol] = interpretation
+
+print(f"Unified dataset: {len(dreams_df)} dreams with proper date assignment")
+print(f"Interpretations dictionary: {len(interpretations_dict)} symbols")
+
+print(f"\n Dataset structure:")
+print(f"Columns: {list(dreams_df.columns)}")
+print(f"Date quality breakdown: {dreams_df['date_quality'].value_counts().to_dict()}")
+print(f"Source breakdown: {dreams_df['source'].value_counts().to_dict()}")
+
+print(f"\n Sample data with date info:")
+sample_df = dreams_df[['dream_text', 'source', 'date_quality', 'dream_date']].head()
+for _, row in sample_df.iterrows():
+    if row['date_quality'] == 'source':
+        date_display = row['dream_date'].strftime('%Y-%m-%d')
+    elif row['date_quality'] == 'today':
+        date_display = "Today's date assigned"
+    else:
+        date_display = row['dream_date'].strftime('%Y-%m-%d') + " (corrected)"
+    print(f"Source: {row['source']}, Quality: {row['date_quality']}, Date: {date_display}")
+print(f"Total dreams ready for processing: {len(dreams_df):,}")
+print(f"Interpretation symbols available: {len(interpretations_dict):,}")
+print(f"\n Date Quality Breakdown:")
+date_quality_counts = dreams_df['date_quality'].value_counts()
+for quality, count in date_quality_counts.items():
+    percentage = (count / len(dreams_df)) * 100
+    print(f"   • {quality}: {count:,} dreams ({percentage:.1f}%)")
+print(f"\n Source Breakdown:")
+source_counts = dreams_df['source'].value_counts()
+for source, count in source_counts.items():
+    percentage = (count / len(dreams_df)) * 100
+    print(f"   • {source}: {count:,} dreams ({percentage:.1f}%)")
+print(f"\n Dream Text Length Statistics:")
+dream_lengths = dreams_df['dream_text'].str.split().apply(len)
+print(f"   • Average words per dream: {dream_lengths.mean():.1f}")
+print(f"   • Shortest dream: {dream_lengths.min()} words")
+print(f"   • Longest dream: {dream_lengths.max()} words")
+print(f"   • Median dream length: {dream_lengths.median():.1f} words")
+
+print(f"\n Sample Interpretations:")
+sample_symbols = list(interpretations_dict.keys())[:5]
+for symbol in sample_symbols:
+    print(f"   • '{symbol}': {interpretations_dict[symbol][:60]}...")
+
+print(f"\n Sample Dreams:")
+for i, row in dreams_df.head(3).iterrows():
+    date_display = "Today" if row['date_quality'] == 'today' else row['dream_date'].strftime('%Y-%m-%d')
+    print(f"   {i+1}. [{row['source']}] {date_display}")
+    print(f"      {row['dream_text'][:80]}...")
+dreams_df = dreams_df.reset_index(drop=True)
+
+print(f" Data quality: {len(dreams_df)} clean, deduplicated dreams with proper date assignment")
+# Dream datasets
+print("dream_data_clean:")
+print(" - Missing values:", dream_data_clean.isna().sum().to_dict())
+print(" - Duplicates:", dream_data_clean.duplicated(subset=['text_dream']).sum(), "\n")
+
+print("dreams_clean:")
+print(" - Missing values:", dreams_clean.isna().sum().to_dict())
+print(" - Duplicates:", dreams_clean.duplicated(subset=['dreams_text']).sum(), "\n")
+
+print("reddit_clean:")
+print(" - Missing values:", reddit_clean.isna().sum().to_dict())
+print(" - Duplicates:", reddit_clean.duplicated(subset=['summary']).sum(), "\n")
+
+# Interpretation datasets
+print("dream_interp_1_clean:")
+print(" - Missing values:", dream_interp_1_clean.isna().sum().to_dict())
+print(" - Duplicates:", dream_interp_1_clean.duplicated().sum(), "\n")
+
+print("dream_interp_2_clean:")
+print(" - Missing values:", dream_interp_2_clean.isna().sum().to_dict())
+print(" - Duplicates:", dream_interp_2_clean.duplicated().sum(), "\n")
+print("Removing duplicates...\n")
+
+before_dreams = len(dreams_clean)
+dreams_clean = dreams_clean.drop_duplicates(subset=['dreams_text'])
+after_dreams = len(dreams_clean)
+print(f"dreams_clean: removed {before_dreams - after_dreams} duplicates")
+
+before_reddit = len(reddit_clean)
+reddit_clean = reddit_clean.drop_duplicates(subset=['summary'])
+after_reddit = len(reddit_clean)
+print(f"reddit_clean: removed {before_reddit - after_reddit} duplicates")
+
+print("\n Cleanup complete!")
+print(" Checking for missing and duplicate values...\n")
+
+# Dream datasets
+print("dream_data_clean:")
+print(" - Missing values:", dream_data_clean.isna().sum().to_dict())
+print(" - Duplicates:", dream_data_clean.duplicated(subset=['text_dream']).sum(), "\n")
+
+print("dreams_clean:")
+print(" - Missing values:", dreams_clean.isna().sum().to_dict())
+print(" - Duplicates:", dreams_clean.duplicated(subset=['dreams_text']).sum(), "\n")
+
+print("reddit_clean:")
+print(" - Missing values:", reddit_clean.isna().sum().to_dict())
+print(" - Duplicates:", reddit_clean.duplicated(subset=['summary']).sum(), "\n")
+
+# Interpretation datasets
+print("dream_interp_1_clean:")
+print(" - Missing values:", dream_interp_1_clean.isna().sum().to_dict())
+print(" - Duplicates:", dream_interp_1_clean.duplicated().sum(), "\n")
+
+print("dream_interp_2_clean:")
+print(" - Missing values:", dream_interp_2_clean.isna().sum().to_dict())
+print(" - Duplicates:", dream_interp_2_clean.duplicated().sum(), "\n")
+
+import pandas as pd
+import numpy as np
+import re
+import warnings
+warnings.filterwarnings('ignore')
+import spacy
+from sentence_transformers import SentenceTransformer, util
+from langdetect import detect
+import ftfy
+from rake_nltk import Rake
+from sklearn.feature_extraction.text import TfidfVectorizer
+from collections import Counter
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+import torch
+import nltk
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+print(f"Your real interpretations_dict has {len(interpretations_dict)} symbols")
+print(f"Sample real symbols: {list(interpretations_dict.keys())[:5]}")
+
+# Load Sentence Transformer for semantic similarity
+print("Loading Sentence Transformer for semantic understanding...")
+sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+print("Sentence Transformer loaded")
+
+# Load spaCy
+print("Loading spaCy...")
+nlp = spacy.load('en_core_web_sm')
+print("spaCy loaded")
+
+try:
+    emotion_classifier = pipeline(
+        "text-classification",
+        model="j-hartmann/emotion-english-distilroberta-base",
+        device=0 if torch.cuda.is_available() else -1
+    )
+    print("Emotion detection model loaded")
+except Exception as e:
+    print(f"Emotion detection failed: {e}. Will work without emotions.")
+    emotion_classifier = None
+def find_similar_symbol_ai(word, symbol_list, threshold=0.6):
+    if not symbol_list:
+        return None
+    word_embedding = sentence_model.encode([word])
+    symbol_embeddings = sentence_model.encode(symbol_list)
+    similarities = util.pytorch_cos_sim(word_embedding, symbol_embeddings)[0]
+    best_idx = torch.argmax(similarities).item()
+    best_similarity = similarities[best_idx].item()
+    if best_similarity >= threshold:
+        return symbol_list[best_idx], best_similarity
+    return None
+def preprocess_dream(dream_text):
+    text = dream_text.lower().strip()
+    doc = nlp(text)
+    entities = [ent.text.lower() for ent in doc.ents]
+    rake.extract_keywords_from_text(text)
+    keywords = rake.get_ranked_phrases()[:10]
+    raw_symbols = []
+    for token in doc:
+        if token.pos_ in ['NOUN', 'ADJ'] and len(token.text) > 2:
+            raw_symbols.append(token.lemma_.lower())
+    raw_symbols = list(set(raw_symbols))
+    entities = list(set(entities))
+
+    return {
+        'keywords': keywords,
+        'entities': entities,
+        'symbols': raw_symbols,
+        'processed_text': text
+    }
+def match_symbols_with_interpretations(symbols, interpretations_dict, threshold=0.6):
+    matched_symbols = {}
+    symbol_list = list(interpretations_dict.keys())
+    for symbol in symbols:
+        if symbol in interpretations_dict:
+            matched_symbols[symbol] = {
+                'interpretation': interpretations_dict[symbol],
+                'match_type': 'exact',
+                'similarity': 1.0
+            }
+        else:
+            similar_result = find_similar_symbol_ai(symbol, symbol_list, threshold)
+            if similar_result:
+                similar_symbol, similarity = similar_result
+                matched_symbols[symbol] = {
+                    'interpretation': interpretations_dict[similar_symbol],
+                    'match_type': 'ai_similar',
+                    'similarity': similarity,
+                    'matched_to': similar_symbol
+                }
+    return matched_symbols
+real_symbols_sample = list(interpretations_dict.keys())[:10]
+test_symbols = ['singer', 'ocean', 'famous', 'drowning', 'soaring']
+
+print(f"Testing with sample from your real dataset: {real_symbols_sample}")
+print(f"Test symbols: {test_symbols}")
+
+for symbol in test_symbols:
+    result = find_similar_symbol_ai(symbol, list(interpretations_dict.keys()), threshold=0.5)
+    if result:
+        similar_symbol, similarity = result
+        print(f"'{symbol}' → '{similar_symbol}' (similarity: {similarity:.3f})")
+    else:
+        print(f"'{symbol}' → No similar symbol found in your dataset")
+print(f"  • Interpretations_dict size: {len(interpretations_dict)} symbols")
+print(f"  • Sample interpretation: '{list(interpretations_dict.keys())[0]}': {list(interpretations_dict.values())[0][:60]}...")
+import torch
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device} for embedding generation")
+print("Loading sentence transformer...")
+sentence_model_embeddings = SentenceTransformer('all-mpnet-base-v2', device=device)
+print("Sentence transformer loaded")
+print(f"Processing {len(dreams_df):,} dreams from unified dataset")
+total_dreams = len(dreams_df)
+batch_size = 256 if device == 'cuda' else 32
+embeddings_list = []
+print(f"Processing {total_dreams:,} dreams with batch size {batch_size}...")
+for i in range(0, total_dreams, batch_size):
+    batch_end = min(i + batch_size, total_dreams)
+    batch_texts = dreams_df.iloc[i:batch_end]['dream_text'].tolist()
+    batch_embeddings = sentence_model_embeddings.encode(
+        batch_texts,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+    embeddings_list.extend(batch_embeddings)
+    if (i // batch_size + 1) % 5 == 0:
+        progress = ((i + len(batch_texts)) / total_dreams) * 100
+        print(f"Progress: {progress:.1f}% ({i + len(batch_texts):,}/{total_dreams:,} dreams)")
+dreams_df['embedding'] = embeddings_list
+print(f"Generated embeddings for {len(dreams_df):,} dreams")
+print(f"Embedding dimension: {len(embeddings_list[0])}")
+print("Building FAISS index for ultra-fast similarity search...")
+embedding_matrix = np.array(embeddings_list).astype('float32')
+embedding_dim = embedding_matrix.shape[1]
+index = faiss.IndexFlatIP(embedding_dim)
+index.add(embedding_matrix)
+print(f"FAISS index built with {index.ntotal:,} vectors")
+if device == 'cuda':
+    torch.cuda.empty_cache()
+    print("GPU memory cleared")
+print(f"\n**Dataset Information:**")
+print(f"   • Dreams processed: {len(dreams_df):,}")
+print(f"   • Date quality breakdown: {dreams_df['date_quality'].value_counts().to_dict()}")
+print(f"   • Source breakdown: {dreams_df['source'].value_counts().to_dict()}")
+print(f"   • FAISS index size: {index.ntotal:,}")
+print(f"   • Embedding dimension: {embedding_dim}")
+def find_similar_dreams_enhanced(query_text, k=5):
+    try:
+        query_embedding = sentence_model_embeddings.encode([query_text], normalize_embeddings=True)
+        query_vec = np.array(query_embedding).astype('float32')
+        similarities, indices = index.search(query_vec, k)
+        results = []
+        for i, (sim_score, idx) in enumerate(zip(similarities[0], indices[0])):
+            dream_row = dreams_df.iloc[idx]
+
+            results.append({
+                'rank': i + 1,
+                'similarity_score': sim_score,
+                'dream_text': dream_row['dream_text'],
+                'dream_id': dream_row['dream_id'],
+                'source': dream_row['source'],
+                'dream_date': dream_row['dream_date'],
+                'date_quality': dream_row['date_quality']
+            })
+        return results
+    except Exception as e:
+        print(f"Search error: {e}")
+        return []
+import numpy as np
+import re
+from sentence_transformers import util
+from collections import OrderedDict
+from sklearn.metrics.pairwise import cosine_similarity
+import warnings
+warnings.filterwarnings('ignore')
+STOPWORDS = {'the', 'is', 'at', 'of', 'on', 'and', 'a', 'to', 'in', 'that', 'it', 'with',
+             'this', 'for', 'as', 'was', 'were', 'been', 'had', 'have', 'would', 'could'}
+
+def remove_duplicates(sequence):
+    seen = set()
+    return [x for x in sequence if not (x in seen or seen.add(x))]
+
+def extract_symbols_comprehensive(dream_text, max_symbols=12):
+    doc = nlp(dream_text)
+    candidates = []
+    for token in doc:
+        if (token.pos_ in ['NOUN', 'PROPN', 'VERB'] and
+            len(token.text) > 2 and
+            token.text.lower() not in STOPWORDS):
+            candidates.append(token.text.lower())
+    for ent in doc.ents:
+        if ent.label_ in ['PERSON', 'GPE', 'ORG'] and len(ent.text) > 2:
+            candidates.append(ent.text.lower())
+    return remove_duplicates(candidates)[:max_symbols]
+
+def extract_keywords(text):
+    words = re.findall(r'\b\w{4,}\b', text.lower())
+    return set(words) - STOPWORDS
+
+def is_interpretation_contextually_relevant(dream_text, interpretation, threshold=0.8):
+    try:
+        dream_embedding = sentence_model.encode(dream_text, normalize_embeddings=True)
+        interp_embedding = sentence_model.encode(interpretation, normalize_embeddings=True)
+
+        similarity = cosine_similarity(
+            dream_embedding.reshape(1, -1),
+            interp_embedding.reshape(1, -1)
+        )[0][0]
+        if similarity >= threshold:
+            return True, similarity
+        dream_keywords = extract_keywords(dream_text)
+        interp_keywords = extract_keywords(interpretation)
+        overlap = dream_keywords.intersection(interp_keywords)
+        if len(overlap) >= 1:
+            return True, similarity
+        dream_roots = {word[:4] for word in dream_keywords if len(word) > 4}
+        interp_roots = {word[:4] for word in interp_keywords if len(word) > 4}
+        root_overlap = dream_roots.intersection(interp_roots)
+        if len(root_overlap) >= 1:
+            return True, similarity
+        return False, similarity
+    except Exception as e:
+        return False, 0.0
+
+def match_symbols_with_optimized_filtering(symbols, dream_text, threshold=0.8):
+    if not symbols:
+        return []
+
+    matches = []
+    symbol_list = list(interpretations_dict.keys())
+
+    try:
+        dataset_embeddings = sentence_model.encode(symbol_list, normalize_embeddings=True)
+        for symbol in symbols:
+            best_match = None
+            if symbol in interpretations_dict:
+                interpretation = interpretations_dict[symbol]
+                is_relevant, relevance_score = is_interpretation_contextually_relevant(
+                    dream_text, interpretation, threshold=0.1
+                )
+
+                if is_relevant:
+                    best_match = {
+                        'symbol': symbol,
+                        'interpretation': interpretation,
+                        'similarity': 1.0,
+                        'relevance': relevance_score,
+                        'match_type': 'exact'
+                    }
+            if not best_match:
+                variations = [
+                    symbol + 'ing', symbol + 's', symbol + 'ed',
+                    symbol[:-1] if len(symbol) > 3 else None,
+                    symbol + 'e' + 's',
+                    symbol[:-1] + 'ing' if symbol.endswith('e') else None
+                ]
+                variations = [v for v in variations if v and len(v) > 2]
+
+                for var in variations:
+                    if var in interpretations_dict:
+                        interpretation = interpretations_dict[var]
+                        is_relevant, relevance_score = is_interpretation_contextually_relevant(
+                            dream_text, interpretation, threshold=0.1
+                        )
+
+                        if is_relevant:
+                            best_match = {
+                                'symbol': var,
+                                'interpretation': interpretation,
+                                'similarity': 0.95,
+                                'relevance': relevance_score,
+                                'match_type': 'variation',
+                                'original': symbol
+                            }
+                            break
+            if not best_match:
+                symbol_embedding = sentence_model.encode([symbol], normalize_embeddings=True)
+                similarities = util.pytorch_cos_sim(symbol_embedding, dataset_embeddings)[0]
+                best_idx = similarities.argmax().item()
+                best_similarity = similarities[best_idx].item()
+                if best_similarity >= threshold:
+                    matched_symbol = symbol_list[best_idx]
+                    interpretation = interpretations_dict[matched_symbol]
+                    is_relevant, relevance_score = is_interpretation_contextually_relevant(
+                        dream_text, interpretation, threshold=0.1
+                    )
+                    if is_relevant:
+                        best_match = {
+                            'symbol': matched_symbol,
+                            'interpretation': interpretation,
+                            'similarity': best_similarity,
+                            'relevance': relevance_score,
+                            'match_type': 'semantic',
+                            'original': symbol
+                        }
+            if best_match:
+                matches.append(best_match)
+    except Exception as e:
+        print(f"Error in symbol matching: {e}")
+        return []
+    matches.sort(key=lambda x: (x['relevance'], x['similarity']), reverse=True)
+    return matches[:6]
+
+def get_emotion_simple(dream_text):
+    if not emotion_classifier:
+        return None
+    try:
+        emotion_result = emotion_classifier(dream_text)
+        if emotion_result and emotion_result[0]['score'] > 0.3:
+            return emotion_result[0]['label'].title()
+    except:
+        pass
+    return None
+
+def interpret_dream_final_optimized(dream_text):
+    symbols = extract_symbols_comprehensive(dream_text, max_symbols=12)
+    matches = match_symbols_with_optimized_filtering(symbols, dream_text)
+    if matches:
+        interpretation = ""
+        found_symbols = []
+        for i, match in enumerate(matches, 1):
+            symbol_name = match['symbol']
+            interp = match['interpretation']
+            match_type = match['match_type']
+            relevance = match['relevance']
+            if match_type == 'variation':
+                interpretation += f"**{symbol_name.title()}** (from '{match['original']}'):\n{interp}\n\n"
+            elif match_type == 'semantic':
+                interpretation += f"**{symbol_name.title()}** (similar to '{match['original']}'):\n{interp}\n\n"
+            else:
+                interpretation += f"**{symbol_name.title()}**:\n{interp}\n\n"
+            found_symbols.append(symbol_name)
+        confidence = 0.75 + (sum(m['relevance'] for m in matches) / len(matches)) * 0.2
+        final_symbols = remove_duplicates(found_symbols)
+    else:
+        interpretation = f"This dream contains symbolic elements: {', '.join(symbols[:3])}. These may represent personal themes that require individual reflection on their meaning in your life context."
+        final_symbols = symbols[:3]
+        confidence = 0.5
+    emotion = get_emotion_simple(dream_text)
+    if emotion:
+        confidence = min(confidence + 0.05, 0.95)
+    return {
+        'symbols': final_symbols,
+        'interpretation': interpretation.strip(),
+        'emotion': emotion,
+        'confidence': confidence,
+        'total_extracted': len(symbols),
+        'contextually_relevant': len(matches) if matches else 0
+    }
+test_dreams = [
+    "I dreamed of flying over water while my mother watched",
+    "A snake bit me in my childhood house during heavy rain",
+    "I was at a concert when snakes appeared and it started raining",
+    "My car wouldn't start and there was fire everywhere",
+    "I saw a giant spider crawling on the wall in my bedroom",
+    "I was running through a dark forest being chased by wolves",
+    "My dead father appeared in my dream and gave me a golden key",
+    "I was swimming in the ocean when suddenly the water turned to blood",
+    "I found myself in my old school unable to find my classroom",
+    "A beautiful woman with wings was singing to me from a tree"
+]
+print("Testing FINAL optimized system with comprehensive test dreams:")
+print("=" * 80)
+for i, dream in enumerate(test_dreams, 1):
+    print(f"\n**Test {i}:** {dream}")
+    print("-" * 50)
+    result = interpret_dream_final_optimized(dream)
+    print(f"**Symbols Found:** {', '.join(result['symbols'])}")
+    print(f"**Extracted:** {result['total_extracted']}, **Contextually Relevant:** {result['contextually_relevant']}")
+    print(f"**Interpretation:**\n{result['interpretation']}")
+    if result['emotion']:
+        print(f"**Emotion:** {result['emotion']}")
+    print(f"**Confidence:** {result['confidence']:.1%}")
+    print("=" * 80)
+def interpret_user_dream(dream_text):
+    result = interpret_dream_final_optimized(dream_text)
+    return {
+        'symbols': result['symbols'],
+        'interpretation': result['interpretation'],
+        'emotion': result['emotion'],
+        'confidence': result['confidence']
+    }
+from sentence_transformers import CrossEncoder
+import numpy as np
+import pandas as pd
+cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L6-v2')
+
+def format_date_label(dream_row):
+    date_quality = dream_row.get('date_quality', '')
+    dream_date = dream_row.get('dream_date', pd.Timestamp.now())
+
+    if date_quality == 'today':
+        return "Today"
+    elif date_quality == 'source':
+        now = pd.Timestamp.now(tz='UTC')
+        dt = pd.Timestamp(dream_date)
+        if dt.tz is None:
+            dt = dt.tz_localize('UTC')
+        diff = now - dt
+        days = diff.days
+        if days < 7:
+            return f"{days} days ago"
+        elif days < 365:
+            return f"{days // 30} months ago"
+        else:
+            return f"{days // 365} years ago"
+    else:
+        return "Historical data"
+
+def enhanced_contextual_search(query_text, k=5):
+    query_emb = sentence_model_embeddings.encode([query_text], normalize_embeddings=True)
+    query_vec = np.array(query_emb).astype('float32')
+    distances, indices = index.search(query_vec, k*5)
+    candidates = []
+    for dist, idx in zip(distances[0], indices[0]):
+        row = dreams_df.iloc[idx]
+        candidates.append({
+            'text': row['dream_text'],
+            'source': row['source'],
+            'date_label': format_date_label(row),
+            'faiss_score': 1.0 / (1.0 + dist),
+            'idx': idx
+        })
+    pairs = [[query_text, c['text']] for c in candidates]
+    cross_scores = cross_encoder.predict(pairs)
+    for i, candidate in enumerate(candidates):
+        candidate['cross_score'] = cross_scores[i]
+        candidate['final_score'] = 0.7 * candidate['cross_score'] + 0.3 * candidate['faiss_score']
+    candidates.sort(key=lambda x: x['final_score'], reverse=True)
+    results = []
+    for i, candidate in enumerate(candidates[:k]):
+        results.append({
+            'rank': i + 1,
+            'score': candidate['final_score'],
+            'text': candidate['text'],
+            'source': candidate['source'],
+            'date': candidate['date_label']
+        })
+    return results
+def analyze_dream(user_text):
+    interpretation = interpret_dream_final_optimized(user_text)
+    similar_dreams = enhanced_contextual_search(user_text, k=5)
+    return {
+        'symbols': interpretation['symbols'],
+        'interpretation': interpretation['interpretation'],
+        'confidence': interpretation['confidence'],
+        'similar_dreams': similar_dreams
+    }
+
+# Test
+query = "I saw a snake in my head"
+results = analyze_dream(query)
+
+print(f"Symbols: {', '.join(results['symbols'])}")
+print(f"Confidence: {results['confidence']:.1%}")
+print("\nSimilar Dreams:")
+for dream in results['similar_dreams']:
+    print(f"{dream['rank']}. Score: {dream['score']:.3f}")
+    print(f"   {dream['text'][:100]}...")
+    print(f"   {dream['source']} - {dream['date']}")
+print("Date quality breakdown:")
+print(dreams_df['date_quality'].value_counts())
+
+print("\nSample dreams with 'source' dates (real historical dates):")
+source_dreams = dreams_df[dreams_df['date_quality'] == 'source']
+if len(source_dreams) > 0:
+    print(f"Found {len(source_dreams)} dreams with real dates")
+    for i, row in source_dreams.head(5).iterrows():
+        date_str = row['dream_date'].strftime('%Y-%m-%d') if pd.notna(row['dream_date']) else 'Invalid date'
+        print(f"  {date_str}: {row['dream_text'][:80]}...")
+else:
+    print("No dreams with source dates found")
+
+print("\nSample dreams with 'corrected' dates:")
+corrected_dreams = dreams_df[dreams_df['date_quality'] == 'corrected']
+if len(corrected_dreams) > 0:
+    print(f"Found {len(corrected_dreams)} dreams with corrected dates")
+    for i, row in corrected_dreams.head(3).iterrows():
+        date_str = row['dream_date'].strftime('%Y-%m-%d') if pd.notna(row['dream_date']) else 'Invalid date'
+        print(f"  {date_str}: {row['dream_text'][:80]}...")
+import pickle
+import pandas as pd
+import numpy as np
+dreams_df.to_pickle('dreams_data.pkl')
+with open('interpretations_data.pkl', 'wb') as f:
+    pickle.dump(interpretations_dict, f)
+import faiss
+faiss.write_index(index, 'dreams_index.faiss')
+with open('model_info.pkl', 'wb') as f:
+    pickle.dump({'sentence_model_name': 'all-mpnet-base-v2', 'embedding_dim': index.d}, f)
+streamlit_app_code = '''
+import streamlit as st
+import pandas as pd
+import numpy as np
+import re
+import json
+from datetime import datetime, timedelta
+import warnings
+import random
+warnings.filterwarnings('ignore')
+
+import spacy
+from sentence_transformers import SentenceTransformer, util, CrossEncoder
+from langdetect import detect, DetectorFactory
+DetectorFactory.seed = 0
+import ftfy
+from rake_nltk import Rake
+from sklearn.feature_extraction.text import TfidfVectorizer
+from collections import Counter, OrderedDict
+import pickle
+import faiss
+import plotly.express as px
+import plotly.graph_objects as go
+import uuid
+import hashlib
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+import torch
+from sklearn.metrics.pairwise import cosine_similarity
+
+st.set_page_config(
+    page_title="DreamSphere - Anonymous Dream Community",
+    page_icon="🌙",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+@st.cache_data
+def load_real_data():
+    dreams_df = pd.read_pickle('dreams_data.pkl')
+    with open('interpretations_data.pkl', 'rb') as f:
+        interpretations_dict = pickle.load(f)
+    return dreams_df, interpretations_dict
+
+@st.cache_resource
+def load_models_and_index():
+    index = faiss.read_index('dreams_index.faiss')
+    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    sentence_model_embeddings = SentenceTransformer('all-mpnet-base-v2')
+    cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L6-v2')
+    nlp = spacy.load('en_core_web_sm')
+
+    try:
+        emotion_classifier = pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base", device=0 if torch.cuda.is_available() else -1)
+    except:
+        emotion_classifier = None
+
+    return index, sentence_model, sentence_model_embeddings, cross_encoder, nlp, emotion_classifier
+
+dreams_df, interpretations_dict = load_real_data()
+index, sentence_model, sentence_model_embeddings, cross_encoder, nlp, emotion_classifier = load_models_and_index()
+
+STOPWORDS = {'the', 'is', 'at', 'of', 'on', 'and', 'a', 'to', 'in', 'that', 'it', 'with', 'this', 'for', 'as', 'was', 'were', 'been', 'had', 'have', 'would', 'could'}
+
+def remove_duplicates(sequence):
+    seen = set()
+    return [x for x in sequence if not (x in seen or seen.add(x))]
+
+def extract_symbols_comprehensive(dream_text, max_symbols=12):
+    doc = nlp(dream_text)
+    candidates = []
+    for token in doc:
+        if (token.pos_ in ['NOUN', 'PROPN', 'VERB'] and len(token.text) > 2 and token.text.lower() not in STOPWORDS):
+            candidates.append(token.text.lower())
+    for ent in doc.ents:
+        if ent.label_ in ['PERSON', 'GPE', 'ORG'] and len(ent.text) > 2:
+            candidates.append(ent.text.lower())
+    return remove_duplicates(candidates)[:max_symbols]
+
+def extract_keywords(text):
+    words = re.findall(r'\\b\\w{4,}\\b', text.lower())
+    return set(words) - STOPWORDS
+
+def is_interpretation_contextually_relevant(dream_text, interpretation, threshold=0.8):
+    try:
+        dream_embedding = sentence_model.encode(dream_text, normalize_embeddings=True)
+        interp_embedding = sentence_model.encode(interpretation, normalize_embeddings=True)
+        similarity = cosine_similarity(dream_embedding.reshape(1, -1), interp_embedding.reshape(1, -1))[0][0]
+
+        if similarity >= threshold:
+            return True, similarity
+
+        dream_keywords = extract_keywords(dream_text)
+        interp_keywords = extract_keywords(interpretation)
+        overlap = dream_keywords.intersection(interp_keywords)
+
+        if len(overlap) >= 1:
+            return True, similarity
+
+        dream_roots = {word[:4] for word in dream_keywords if len(word) > 4}
+        interp_roots = {word[:4] for word in interp_keywords if len(word) > 4}
+        root_overlap = dream_roots.intersection(interp_roots)
+
+        if len(root_overlap) >= 1:
+            return True, similarity
+
+        return False, similarity
+    except:
+        return False, 0.0
+
+def match_symbols_with_optimized_filtering(symbols, dream_text, threshold=0.8):
+    if not symbols:
+        return []
+
+    matches = []
+    symbol_list = list(interpretations_dict.keys())
+
+    try:
+        dataset_embeddings = sentence_model.encode(symbol_list, normalize_embeddings=True)
+
+        for symbol in symbols:
+            best_match = None
+
+            if symbol in interpretations_dict:
+                interpretation = interpretations_dict[symbol]
+                is_relevant, relevance_score = is_interpretation_contextually_relevant(dream_text, interpretation, threshold=0.1)
+                if is_relevant:
+                    best_match = {'symbol': symbol, 'interpretation': interpretation, 'similarity': 1.0, 'relevance': relevance_score, 'match_type': 'exact'}
+
+            if not best_match:
+                variations = [symbol + 'ing', symbol + 's', symbol + 'ed', symbol[:-1] if len(symbol) > 3 else None, symbol + 'e' + 's', symbol[:-1] + 'ing' if symbol.endswith('e') else None]
+                variations = [v for v in variations if v and len(v) > 2]
+
+                for var in variations:
+                    if var in interpretations_dict:
+                        interpretation = interpretations_dict[var]
+                        is_relevant, relevance_score = is_interpretation_contextually_relevant(dream_text, interpretation, threshold=0.1)
+                        if is_relevant:
+                            best_match = {'symbol': var, 'interpretation': interpretation, 'similarity': 0.95, 'relevance': relevance_score, 'match_type': 'variation', 'original': symbol}
+                            break
+
+            if not best_match:
+                symbol_embedding = sentence_model.encode([symbol], normalize_embeddings=True)
+                similarities = util.pytorch_cos_sim(symbol_embedding, dataset_embeddings)[0]
+                best_idx = similarities.argmax().item()
+                best_similarity = similarities[best_idx].item()
+
+                if best_similarity >= threshold:
+                    matched_symbol = symbol_list[best_idx]
+                    interpretation = interpretations_dict[matched_symbol]
+                    is_relevant, relevance_score = is_interpretation_contextually_relevant(dream_text, interpretation, threshold=0.1)
+                    if is_relevant:
+                        best_match = {'symbol': matched_symbol, 'interpretation': interpretation, 'similarity': best_similarity, 'relevance': relevance_score, 'match_type': 'semantic', 'original': symbol}
+
+            if best_match:
+                matches.append(best_match)
+    except Exception as e:
+        print(f"Error in symbol matching: {e}")
+        return []
+
+    matches.sort(key=lambda x: (x['relevance'], x['similarity']), reverse=True)
+    return matches[:6]
+
+def get_emotion_simple(dream_text):
+    if not emotion_classifier:
+        return None
+    try:
+        emotion_result = emotion_classifier(dream_text)
+        if emotion_result and emotion_result[0]['score'] > 0.3:
+            return emotion_result[0]['label'].title()
+    except:
+        pass
+    return None
+
+def interpret_dream_final_optimized(dream_text):
+    symbols = extract_symbols_comprehensive(dream_text, max_symbols=12)
+    matches = match_symbols_with_optimized_filtering(symbols, dream_text)
+
+    if matches:
+        interpretation = ""
+        found_symbols = []
+
+        for match in matches:
+            symbol_name = match['symbol']
+            interp = match['interpretation']
+            match_type = match['match_type']
+
+            if match_type == 'variation':
+                interpretation += f"**{symbol_name.title()}** (from '{match['original']}'):\\n{interp}\\n\\n"
+            elif match_type == 'semantic':
+                interpretation += f"**{symbol_name.title()}** (similar to '{match['original']}'):\\n{interp}\\n\\n"
+            else:
+                interpretation += f"**{symbol_name.title()}**:\\n{interp}\\n\\n"
+
+            found_symbols.append(symbol_name)
+
+        confidence = 0.75 + (sum(m['relevance'] for m in matches) / len(matches)) * 0.2
+        final_symbols = remove_duplicates(found_symbols)
+    else:
+        # HONEST NO-INTERPRETATION HANDLING
+        interpretation = ""
+        final_symbols = symbols[:3] if symbols else ["dreams", "subconscious"]
+        confidence = 0.2  # Low confidence when no matches
+
+    emotion = get_emotion_simple(dream_text)
+    if emotion:
+        confidence = min(confidence + 0.05, 0.95)
+
+    return {
+        'symbols': final_symbols,
+        'interpretation': interpretation.strip(),
+        'emotion': emotion,
+        'confidence': confidence,
+        'total_extracted': len(symbols),
+        'contextually_relevant': len(matches) if matches else 0
+    }
+
+def interpret_user_dream(dream_text):
+    result = interpret_dream_final_optimized(dream_text)
+    return {'symbols': result['symbols'], 'interpretation': result['interpretation'], 'emotion': result['emotion'], 'confidence': result['confidence']}
+
+def format_date_label(dream_row):
+    date_quality = dream_row.get('date_quality', '')
+    dream_date = dream_row.get('dream_date', pd.Timestamp.now())
+
+    if date_quality == 'today':
+        return "Today"
+    elif date_quality == 'source':
+        now = pd.Timestamp.now(tz='UTC')
+        dt = pd.Timestamp(dream_date)
+        if dt.tz is None:
+            dt = dt.tz_localize('UTC')
+        diff = now - dt
+        days = diff.days
+        if days < 7:
+            return f"{days} days ago"
+        elif days < 365:
+            return f"{days // 30} months ago"
+        else:
+            return f"{days // 365} years ago"
+    else:
+        return "Historical data"
+
+def enhanced_contextual_search(query_text, k=5):
+    query_emb = sentence_model_embeddings.encode([query_text], normalize_embeddings=True)
+    query_vec = np.array(query_emb).astype('float32')
+    distances, indices = index.search(query_vec, k*5)
+
+    candidates = []
+    for dist, idx in zip(distances[0], indices[0]):
+        row = dreams_df.iloc[idx]
+        candidates.append({
+            'text': row['dream_text'],
+            'source': row['source'],
+            'date_label': format_date_label(row),
+            'faiss_score': 1.0 / (1.0 + dist),
+            'idx': idx
+        })
+
+    pairs = [[query_text, c['text']] for c in candidates]
+    cross_scores = cross_encoder.predict(pairs)
+
+    for i, candidate in enumerate(candidates):
+        candidate['cross_score'] = cross_scores[i]
+        candidate['final_score'] = 0.7 * candidate['cross_score'] + 0.3 * candidate['faiss_score']
+
+    candidates.sort(key=lambda x: x['final_score'], reverse=True)
+
+    results = []
+    for i, candidate in enumerate(candidates[:k]):
+        results.append({
+            'rank': i + 1,
+            'score': candidate['final_score'],
+            'text': candidate['text'],
+            'source': candidate['source'],
+            'date': candidate['date_label']
+        })
+
+    return results
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap');
+    .main { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+    .stApp { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+    .dream-header { background: linear-gradient(90deg, #1e3c72 0%, #2a5298 100%); padding: 2rem; border-radius: 15px; text-align: center; margin-bottom: 2rem; box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37); }
+    .dream-title { font-family: 'Poppins', sans-serif; font-size: 3rem; font-weight: 700; color: #ffffff; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); margin-bottom: 0.5rem; }
+    .dream-subtitle { font-family: 'Poppins', sans-serif; font-size: 1.2rem; color: #e0e7ff; font-weight: 300; }
+    .dream-card { background: rgba(255, 255, 255, 0.1); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 20px; padding: 1.5rem; margin: 1rem 0; box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37); }
+    .symbol-tag { background: linear-gradient(45deg, #ff6b6b, #ee5a52); color: white; padding: 0.3rem 0.8rem; border-radius: 20px; margin: 0.2rem; display: inline-block; font-size: 0.9rem; font-weight: 600; }
+    .emotion-badge { background: linear-gradient(45deg, #4ecdc4, #44a08d); color: white; padding: 0.5rem 1rem; border-radius: 25px; font-weight: 600; text-align: center; }
+    .similar-dream { background: rgba(255, 255, 255, 0.05); border-left: 4px solid #4ecdc4; padding: 1rem; margin: 0.8rem 0; border-radius: 0 10px 10px 0; transition: all 0.3s ease; }
+    .similar-dream:hover { background: rgba(255, 255, 255, 0.1); transform: translateX(5px); }
+    .stat-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.5rem; border-radius: 15px; text-align: center; color: white; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+    .stat-number { font-size: 2.5rem; font-weight: 700; margin-bottom: 0.5rem; }
+    .stat-label { font-size: 1rem; opacity: 0.9; }
+    .connection-card { background: rgba(255, 255, 255, 0.1); backdrop-filter: blur(10px); border-radius: 15px; padding: 1.5rem; border: 1px solid rgba(255, 255, 255, 0.2); transition: all 0.3s ease; }
+    .connection-card:hover { transform: translateY(-5px); box-shadow: 0 10px 40px rgba(31, 38, 135, 0.4); }
+    .chat-bubble { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 1rem; border-radius: 20px 20px 20px 5px; margin: 0.5rem 0; max-width: 80%; }
+    .stButton > button { background: linear-gradient(45deg, #667eea, #764ba2) !important; color: white !important; border: none !important; border-radius: 25px !important; padding: 0.75rem 2rem !important; font-weight: 600 !important; }
+    .no-interpretation { background: linear-gradient(45deg, #ff9a9e, #fecfef); color: #333; padding: 1.5rem; border-radius: 15px; text-align: center; margin: 1rem 0; }
+    #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
+    .stMarkdown, .stText, p, span, div { color: white !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize session state
+def init_session_state():
+    if 'user_id' not in st.session_state:
+        st.session_state.user_id = str(uuid.uuid4())[:8]
+    if 'dream_history' not in st.session_state:
+        st.session_state.dream_history = []
+    if 'connections' not in st.session_state:
+        st.session_state.connections = []
+    if 'messages' not in st.session_state:
+        st.session_state.messages = {}
+    if 'current_dream_result' not in st.session_state:
+        st.session_state.current_dream_result = None
+
+init_session_state()
+
+# Main header
+st.markdown("""
+<div class="dream-header">
+    <div class="dream-title">🌙 DreamSphere</div>
+    <div class="dream-subtitle">Anonymous Dream Community - Connect Through Your Subconscious</div>
+</div>
+""", unsafe_allow_html=True)
+
+with st.sidebar:
+    st.markdown("### 🌟 Navigation")
+    page = st.selectbox("Choose your journey:", ["🏠 Home", "💭 Share Dream", "🔍 Discover Dreams", "👥 Connections", "📊 My Profile", "💬 Dream Chat"])
+    st.markdown("---")
+    st.markdown(f"**Anonymous ID:** `{st.session_state.user_id}`")
+    st.markdown(f"**Dreams Shared:** {len(st.session_state.dream_history)}")
+    st.markdown(f"**Connections:** {len(st.session_state.connections)}")
+    st.markdown("### 🎯 Platform Stats")
+    st.markdown(f"**Total Dreams:** {len(dreams_df):,}")
+    st.markdown(f"**Symbols:** {len(interpretations_dict):,}")
+    st.markdown("---")
+    st.markdown("### 🧪 Testing Features")
+    if st.button("🎭 Add Demo Connection", help="Add a fake dreamer connection for testing"):
+        demo_connections = [
+            {
+                'dream_text': 'I was flying over a beautiful ocean and felt so free and peaceful...',
+                'similarity': 0.87,
+                'source': 'demo_dreamer_alpha',
+                'id': 'demo_dreamer_001'
+            },
+            {
+                'dream_text': 'A wise snake appeared in my garden and spoke ancient wisdom to me...',
+                'similarity': 0.72,
+                'source': 'demo_dreamer_beta',
+                'id': 'demo_dreamer_002'
+            },
+            {
+                'dream_text': 'I found myself in my childhood home but everything was mysteriously different...',
+                'similarity': 0.91,
+                'source': 'demo_dreamer_gamma',
+                'id': 'demo_dreamer_003'
+            },
+            {
+                'dream_text': 'Running through a dark forest while being chased by shadow wolves...',
+                'similarity': 0.68,
+                'source': 'demo_dreamer_delta',
+                'id': 'demo_dreamer_004'
+            },
+            {
+                'dream_text': 'My deceased grandmother appeared and gave me a golden key with symbols...',
+                'similarity': 0.79,
+                'source': 'demo_dreamer_epsilon',
+                'id': 'demo_dreamer_005'
+            }
+        ]
+        new_connection = random.choice(demo_connections)
+        existing_ids = [conn['id'] for conn in st.session_state.connections]
+        if new_connection['id'] not in existing_ids:
+            st.session_state.connections.append(new_connection)
+            st.success(f"✅ Connected with {new_connection['source']}!")
+            st.balloons()
+            st.rerun()
+        else:
+            st.info("🔗 Already connected to this demo dreamer!")
+
+    st.markdown("<small>💡 Use demo connections to test the Connections and Chat features!</small>", unsafe_allow_html=True)
+
+# HOME PAGE
+if page == "🏠 Home":
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.markdown("## Welcome to Your Dream Journey 🌙")
+        st.markdown("""
+        <div class="dream-card">
+        <h3>🌟 Discover the Hidden Meanings</h3>
+        <p>Share your dreams anonymously and unlock their symbolic meanings using advanced ML interpretation with REAL dream data.</p>
+        </div>
+        <div class="dream-card">
+        <h3>🤝 Connect with Dreamers</h3>
+        <p>Find people who've experienced similar dreams from our database of real dreams.</p>
+        </div>
+        <div class="dream-card">
+        <h3>🔒 Complete Privacy</h3>
+        <p>Your identity remains anonymous while you explore the depths of your mind with others.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col2:
+        st.markdown("### 📈 Community Stats")
+        col2_1, col2_2 = st.columns(2)
+        with col2_1:
+            st.markdown(f"""<div class="stat-card"><div class="stat-number">{len(dreams_df):,}</div><div class="stat-label">Real Dreams</div></div>""", unsafe_allow_html=True)
+        with col2_2:
+            st.markdown(f"""<div class="stat-card"><div class="stat-number">{len(interpretations_dict):,}</div><div class="stat-label">Real Symbols</div></div>""", unsafe_allow_html=True)
+
+        st.markdown("### 🌙 Recent Dreams from Database")
+        recent_dreams = dreams_df.sample(3)
+        for _, dream in recent_dreams.iterrows():
+            source_display = dream.get('source', 'unknown')
+            st.markdown(f"""<div class="similar-dream"><small>{source_display} • Real dream data</small><br>{dream['dream_text'][:100]}...</div>""", unsafe_allow_html=True)
+
+# SHARE DREAM PAGE
+elif page == "💭 Share Dream":
+    st.markdown("## Share Your Dream 💭")
+    st.markdown("*Using REAL interpretations with advanced ML emotion detection*")
+
+    # Form contains ONLY input and submit - NO other buttons
+    with st.form("dream_form"):
+        dream_text = st.text_area("Describe your dream:", height=150, placeholder="I dreamed that I was flying over a beautiful ocean when suddenly...")
+        submitted = st.form_submit_button("✨ Interpret My Dream")
+
+    # Process form submission OUTSIDE the form
+    if submitted and dream_text:
+        with st.spinner("🔮 Analyzing your dream with REAL ML models..."):
+            result = interpret_user_dream(dream_text)
+
+            # Store in session state
+            st.session_state.current_dream_result = {
+                'text': dream_text,
+                'result': result,
+                'timestamp': datetime.now(),
+                'id': len(st.session_state.dream_history)
+            }
+            st.session_state.dream_history.append(st.session_state.current_dream_result)
+
+    # Display results if available - OUTSIDE form
+    if st.session_state.current_dream_result:
+        result = st.session_state.current_dream_result['result']
+        dream_text = st.session_state.current_dream_result['text']
+
+        st.markdown("---")
+        st.markdown("## 🌟 Your Dream Interpretation")
+
+        col1, col2 = st.columns([3, 1])
+
+        with col1:
+            st.markdown("### 🔮 Symbolic Meanings")
+
+            # HONEST NO-INTERPRETATION HANDLING - UPDATED TEXT
+            if result['interpretation'] and result['interpretation'].strip():
+                st.markdown(f"""<div class="dream-card">{result['interpretation']}</div>""", unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div class="no-interpretation">
+                    <h4>🤔 No Direct Interpretation Found</h4>
+                    <p>Our model couldn't find specific symbolic meanings in our database for this dream. This doesn't mean your dream isn't meaningful! Dreams are highly personal and can have unique significance based on your life experiences, emotions, and current situations.</p>
+                    <p><strong>Consider:</strong> What emotions did you feel? What stood out most? Sometimes the most important meaning comes from your own reflection.</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.markdown("### 🏷️ Dream Elements Found")
+            if result['symbols']:
+                symbols_html = ""
+                for symbol in result['symbols']:
+                    symbols_html += f'<span class="symbol-tag">{symbol}</span> '
+                st.markdown(symbols_html, unsafe_allow_html=True)
+            else:
+                st.markdown("<em>No specific symbols identified in this dream.</em>")
+
+        with col2:
+            st.markdown("### 📊 Analysis")
+            if result['emotion']:
+                st.markdown(f"""<div class="emotion-badge">😊 {result['emotion']}</div>""", unsafe_allow_html=True)
+
+            confidence_color = "#4ecdc4" if result['confidence'] > 0.7 else "#ffd93d" if result['confidence'] > 0.3 else "#ff6b6b"
+            st.markdown(f"""<div style="background: {confidence_color}; color: white; padding: 1rem; border-radius: 10px; text-align: center; margin: 1rem 0;"><strong>Confidence: {result['confidence']:.1%}</strong></div>""", unsafe_allow_html=True)
+
+        # Find Similar Dreams button - NOW OUTSIDE the form
+        st.markdown("---")
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col2:
+            if st.button("🔍 Find Similar Dreams", key="find_similar_main", use_container_width=True):
+                st.session_state.last_search = dream_text
+                st.rerun()
+
+# DISCOVER DREAMS PAGE
+elif page == "🔍 Discover Dreams":
+    st.markdown("## Discover Similar Dreams 🔍")
+    st.markdown(f"*Search through {len(dreams_df):,} real dreams with ML similarity matching*")
+
+    search_text = st.text_input("Search for dreams:", placeholder="flying, water, snakes...")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        time_filter = st.selectbox("Time Period:", ["All Time", "Last 24 Hours", "Last Week", "Last Month", "Last Year"])
+    with col2:
+        emotion_filter = st.selectbox("Emotion:", ["Any", "Joy", "Sadness", "Fear", "Anger", "Surprise", "Love"])
+    with col3:
+        source_filter = st.selectbox("Source:", ["All Sources", "dream_data", "dreams", "reddit"])
+
+    if st.button("🔍 Search Dreams", key="search_dreams_main") or hasattr(st.session_state, 'last_search'):
+        search_query = search_text or getattr(st.session_state, 'last_search', '')
+
+        if search_query:
+            with st.spinner("🔍 Finding similar dreams using YOUR EXACT ML models..."):
+                similar_results = enhanced_contextual_search(search_query, k=8)
+
+            st.markdown(f"### Found {len(similar_results)} Similar REAL Dreams")
+
+            for i, dream in enumerate(similar_results):
+                with st.expander(f"Real Dream #{i+1} - Similarity: {dream['score']:.1%}"):
+                    col1, col2 = st.columns([3, 1])
+
+                    with col1:
+                        st.markdown("**Dream Text:**")
+                        st.markdown(f'<div class="similar-dream">{dream["text"]}</div>', unsafe_allow_html=True)
+
+                    with col2:
+                        st.markdown(f"**Source:** {dream['source']}")
+                        st.markdown(f"**Date:** {dream['date']}")
+                        st.markdown(f"**Match:** {dream['score']:.1%}")
+
+                        # FIXED: Connect button with proper action
+                        connect_key = f"connect_{i}_{abs(hash(dream['text'][:50]))}"
+                        if st.button("Connect 💬", key=connect_key):
+                            # CREATE the connection
+                            new_connection = {
+                                'dream_text': dream['text'][:100] + '...',
+                                'similarity': dream['score'],
+                                'source': dream['source'],
+                                'id': f"dreamer_{i}_{abs(hash(dream['text'][:30]))}"
+                            }
+
+                            # CHECK if already connected
+                            already_connected = any(
+                                conn['id'] == new_connection['id']
+                                for conn in st.session_state.connections
+                            )
+
+                            if not already_connected:
+                                st.session_state.connections.append(new_connection)
+                                st.success("✅ Connection made! Check your Connections page.")
+                                st.balloons()  # Fun visual feedback
+                            else:
+                                st.info("🔗 Already connected to this dreamer!")
+
+# CONNECTIONS PAGE
+elif page == "👥 Connections":
+    st.markdown("## Your Dream Connections 👥")
+    if st.session_state.connections:
+        st.markdown(f"### You have {len(st.session_state.connections)} connection(s)")
+        for i, connection in enumerate(st.session_state.connections):
+            st.markdown(f"""
+            <div class="connection-card">
+                <h4>🌙 Dream Connection #{i+1}</h4>
+                <p><strong>Similar Dream:</strong> {connection['dream_text']}</p>
+                <p><strong>Similarity:</strong> {connection['similarity']:.1%} • <strong>Source:</strong> {connection['source']}</p>
+                <p><strong>Connection ID:</strong> <code>{connection['id']}</code></p>
+            </div>
+            """, unsafe_allow_html=True)
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                if st.button("💬 Start Chat", key=f"chat_start_{i}"):
+                    st.session_state.active_chat = connection['id']
+                    st.success(f"✅ Chat started with {connection['id'][:15]}...")
+                    st.rerun()
+            with col2:
+                if st.button("🔍 View Profile", key=f"profile_view_{i}"):
+                    with st.expander("Anonymous Dreamer Profile", expanded=True):
+                        st.write(f"**Connection Strength:** {connection['similarity']:.1%}")
+                        st.write(f"**Dream Theme:** {connection['source']}")
+                        st.write(f"**Status:** Active Connection")
+                        st.write("**Shared Interests:** Dream symbolism, subconscious exploration")
+            with col3:
+                if st.button("❌ Remove", key=f"remove_connection_{i}"):
+                    removed_connection = st.session_state.connections.pop(i)
+                    st.success(f"✅ Removed connection with {removed_connection['id'][:15]}...")
+                    st.rerun()
+    else:
+        st.markdown("""
+        <div class="dream-card">
+            <h3>No connections yet! 🌙</h3>
+            <p>Go to <strong>Discover Dreams</strong> to search for similar dreamers and click <strong>Connect</strong> to start building your dream community!</p>
+            <p>💡 Or try the <strong>🎭 Add Demo Connection</strong> button in the sidebar to test the features!</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+# MY PROFILE PAGE
+elif page == "📊 My Profile":
+    st.markdown("## Your Dream Profile 📊")
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        if st.session_state.dream_history:
+            all_symbols = []
+            all_emotions = []
+
+            for dream in st.session_state.dream_history:
+                all_symbols.extend(dream['result']['symbols'])
+                if dream['result']['emotion']:
+                    all_emotions.append(dream['result']['emotion'])
+
+            if all_symbols:
+                st.markdown("### 🏷️ Your Most Common Symbols")
+                symbol_counts = pd.Series(all_symbols).value_counts().head(8)
+                fig = px.bar(x=symbol_counts.values, y=symbol_counts.index, orientation='h', color=symbol_counts.values, color_continuous_scale='viridis')
+                fig.update_layout(showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color='white')
+                st.plotly_chart(fig, use_container_width=True)
+
+            if all_emotions:
+                st.markdown("### 😊 Emotional Patterns")
+                emotion_counts = pd.Series(all_emotions).value_counts()
+                fig = px.pie(values=emotion_counts.values, names=emotion_counts.index, color_discrete_sequence=px.colors.qualitative.Set3)
+                fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', font_color='white')
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.markdown("""<div class="dream-card"><h3>Start Your Dream Journey! 🌟</h3><p>Share your first dream to begin building your personalized profile.</p></div>""", unsafe_allow_html=True)
+
+    with col2:
+        st.markdown("### 📈 Your Stats")
+        dreams_shared = len(st.session_state.dream_history)
+        connections_made = len(st.session_state.connections)
+
+        st.markdown(f"""<div class="stat-card"><div class="stat-number">{dreams_shared}</div><div class="stat-label">Dreams Shared</div></div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="stat-card"><div class="stat-number">{connections_made}</div><div class="stat-label">Connections</div></div>""", unsafe_allow_html=True)
+
+        if dreams_shared > 0:
+            avg_confidence = sum(d['result']['confidence'] for d in st.session_state.dream_history) / dreams_shared
+            st.markdown(f"""<div class="stat-card"><div class="stat-number">{avg_confidence:.1%}</div><div class="stat-label">Avg Confidence</div></div>""", unsafe_allow_html=True)
+
+# DREAM CHAT PAGE
+elif page == "💬 Dream Chat":
+    st.markdown("## Anonymous Dream Chat 💬")
+
+    if hasattr(st.session_state, 'active_chat') and st.session_state.active_chat:
+        st.markdown(f"### 💬 Chatting with: `{st.session_state.active_chat[:20]}...`")
+        st.markdown("🔒 *This conversation is anonymous and secure*")
+
+        # Initialize chat if new
+        if st.session_state.active_chat not in st.session_state.messages:
+            st.session_state.messages[st.session_state.active_chat] = [
+                {"role": "system", "content": "Hello! I saw we had similar dreams. Would you like to discuss our experiences?"}
+            ]
+
+        # Display messages
+        for message in st.session_state.messages[st.session_state.active_chat]:
+            if message["role"] == "user":
+                st.markdown(f"""
+                <div style="text-align: right;">
+                    <div class="chat-bubble" style="margin-left: 20%; background: linear-gradient(135deg, #4ecdc4 0%, #44a08d 100%);">
+                        <strong>You:</strong> {message["content"]}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="chat-bubble">
+                    <strong>Anonymous Dreamer:</strong> {message["content"]}
+                </div>
+                """, unsafe_allow_html=True)
+
+        # Chat form
+        with st.form("chat_form", clear_on_submit=True):
+            message = st.text_input("Type your message:", placeholder="Share your thoughts about the dream...")
+            if st.form_submit_button("Send 📤"):
+                if message:
+                    # Add user message
+                    st.session_state.messages[st.session_state.active_chat].append(
+                        {"role": "user", "content": message}
+                    )
+
+                    # Add simulated response
+                    responses = [
+                        "That's fascinating! I had a similar feeling in my dream.",
+                        "Dreams can be so mysterious, right? What do you think it means?",
+                        "I wonder if there's a deeper meaning to this pattern we both experienced.",
+                        "Thank you for sharing. It helps to know others experience this too.",
+                        "I've been thinking about my dream since I shared it. Your perspective is interesting!",
+                        "Do you often remember your dreams? This one felt particularly vivid to me.",
+                        "The symbolism in our dreams seems connected somehow.",
+                        "I never thought about it that way before. Dreams are so personal yet universal."
+                    ]
+                    st.session_state.messages[st.session_state.active_chat].append(
+                        {"role": "system", "content": random.choice(responses)}
+                    )
+                    st.rerun()
+
+        # Chat actions
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Refresh Chat", key="refresh_chat"):
+                st.rerun()
+        with col2:
+            if st.button("❌ End Chat", key="end_chat"):
+                st.session_state.active_chat = None
+                st.success("Chat ended. You can start a new one from Connections.")
+                st.rerun()
+
+    else:
+        st.markdown("""
+        <div class="dream-card">
+            <h3>💬 No Active Chats</h3>
+            <p>Connect with other dreamers through the <strong>Connections</strong> page to start anonymous conversations about your shared dream experiences.</p>
+            <p>💡 Try the <strong>🎭 Add Demo Connection</strong> button in the sidebar to create test connections!</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+# Footer
+st.markdown("---")
+st.markdown(f"""<div style="text-align: center; opacity: 0.7; padding: 2rem;">🌙 DreamSphere - Powered by {len(dreams_df):,} Real Dreams & {len(interpretations_dict):,} Real Symbols<br><small>Honest interpretations • Real connections • Your privacy protected</small></div>""", unsafe_allow_html=True)
+'''
+with open('dreamsphere_final.py', 'w', encoding='utf-8') as f:
+    f.write(streamlit_app_code)
+
+print("✅ FINAL DreamSphere app created!")
+print("📁 File: dreamsphere_final.py")
+
+def launch_final_app():
+    """Launch the FINAL app with demo connections"""
+    print("🚀 Launching FINAL DreamSphere with demo connections!")
+    import subprocess
+    subprocess.run(["streamlit", "run", "dreamsphere_final.py", "--server.port", "8501"])
+
+def launch_final_with_ngrok():
+    """Launch FINAL app with ngrok"""
+    from pyngrok import ngrok
+    import subprocess
+    import threading
+    import time
+
+    def run_streamlit():
+        subprocess.run(["streamlit", "run", "dreamsphere_final.py", "--server.port", "8501", "--server.address", "0.0.0.0", "--server.enableCORS", "false", "--server.headless", "true"])
+
+    streamlit_thread = threading.Thread(target=run_streamlit, daemon=True)
+    streamlit_thread.start()
+    time.sleep(8)
+
+    try:
+        tunnel = ngrok.connect(8501)
+        print(f"🚀 FINAL DreamSphere LIVE!")
+        print(f"🌐 Public URL: {tunnel.public_url}")
+        print("✅ Demo connections enabled for testing!")
+        print("✅ 'Model' terminology instead of 'AI'!")
+        return tunnel.public_url
+    except Exception as e:
+        print(f"Error: {e}")
+        return "http://localhost:8501"
+from pyngrok import ngrok
+ngrok.kill()
+print("✅ All ngrok tunnels cleared!")
+import os
+os.system("pkill -f ngrok")
+os.system("pkill -f streamlit")
+print("✅ Processes cleared manually too!")
+!curl -I http://localhost:8501
+!ps aux | grep streamlit
+!lsof -i :8501
+import os
+import subprocess
+import time
+import threading
+os.system("pkill -f streamlit")
+os.system("pkill -f ngrok")
+print("✅ Cleaned existing processes")
+def run_streamlit():
+    """Run Streamlit server"""
+    try:
+        subprocess.run([
+            "streamlit", "run", "dreamsphere_final.py",
+            "--server.port", "8501",
+            "--server.address", "0.0.0.0",
+            "--server.headless", "true",
+            "--server.fileWatcherType", "none"
+        ], check=True)
+    except Exception as e:
+        print(f"Streamlit error: {e}")
+print("🚀 Starting Streamlit server...")
+streamlit_thread = threading.Thread(target=run_streamlit, daemon=True)
+streamlit_thread.start()
+print("⏳ Waiting 20 seconds for Streamlit to start...")
+time.sleep(20)
+try:
+    import requests
+    response = requests.get("http://localhost:8501", timeout=5)
+    print(f"✅ Streamlit is running! Status: {response.status_code}")
+except Exception as e:
+    print(f"❌ Streamlit not responding: {e}")
+!ps aux | grep streamlit
+from pyngrok import ngrok
+import time
+ngrok.kill()
+ngrok.set_auth_token("32CBsytT8wDtEO1Dj5oobXpVSZf_4VYqSAf53wbm8eHxj4jYk")
+!streamlit run dreamsphere_updated.py --server.port 8501 &>/content/logs.txt &
+time.sleep(10)
+tunnel = ngrok.connect(8501)
+print(f"✅ Using port 8501: {tunnel.public_url}")
+!curl -I http://localhost:8501
+!ps aux | grep streamlit
+!lsof -i :8501
