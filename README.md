@@ -1,0 +1,1 @@
+This dream interpretation platform that processes real dream data from multiple sources. The project involved building a complete ML pipeline from data preprocessing to web deployment using Streamlit.
